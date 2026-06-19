@@ -103,7 +103,7 @@ if ! [[ $RANGE =~ ^[^[:space:]]+\.\.[^[:space:]]+$ ]]; then
 fi
 
 if [[ -z "${KERNEL_DIR}" || -z "${BRANCH_NAME}" ]]; then
-  echo "Error: values for parameters -f, -d, -b are required."
+  echo "Error: values for parameters -d, -b are required."
   help
   exit 1
 fi
@@ -128,12 +128,14 @@ fi
 TOP_DIR="$(dirname "${PARENT_DIR}")"
 SUFFIX="$(tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 8)"
 TMP_ACPICA="${TOP_DIR}/acpica_${SUFFIX}"
+TMP_WORK="/dev/shm/port_commits_${SUFFIX}"
+mkdir -p "${TMP_WORK}"
 
 # From now on, if anything goes wrong, delete the temporary working directory
 # and the temporary working files
 cleanup() {
   rm -rf "${TMP_ACPICA}" >/dev/null 2>&1 || true
-  rm -f "$TMP_CURRENT" "$TMP_PARENT" >/dev/null 2>&1 || true
+  rm -rf "${TMP_WORK}" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -261,13 +263,14 @@ for CMT in "${COMMITS[@]}"; do
 
     ANYTHING_TO_ADD=1
 
-    TMP_CURRENT=$(mktemp -p /dev/shm current_XXXXXX_${FILE_NAME})
-    TMP_PARENT=$(mktemp -p /dev/shm parent_XXXXXX_${FILE_NAME})
+    TMP_CURRENT=$(mktemp -p "${TMP_WORK}" current_XXXXXX_${FILE_NAME})
+    TMP_PARENT=$(mktemp -p "${TMP_WORK}" parent_XXXXXX_${FILE_NAME})
 
     cd "${TMP_ACPICA}"
 
     if ! git cat-file -p "${CMT}:${FILE}" > "$TMP_CURRENT" 2>/dev/null; then
       echo "Warning: ${FILE} not found at ${CMT}! Skipping."
+      rm -f "$TMP_CURRENT" "$TMP_PARENT" >/dev/null 2>&1 || true
       continue
     fi
 
@@ -281,13 +284,14 @@ for CMT in "${COMMITS[@]}"; do
     clang-format -i --style="file:${TOOL_DIR}/clang-format" "$TMP_PARENT"
     clang-format -i --style="file:${TOOL_DIR}/clang-format" "$TMP_CURRENT"
 
+    DEST_DIR="$(dirname -- "$DEST")"
     DIFF_RESULT=$(diff --normal -E -p -w -B -b "$TMP_PARENT" "$TMP_CURRENT" || true)
     if [ -n "$DIFF_RESULT" ]; then
-        if ! patch -l -n -F 4 -d "${KERNEL_DIR}/${DST_REL}" "$FILE_NAME" <<< "$DIFF_RESULT"; then
+        if ! patch -l -n -F 4 -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT"; then
             ANYTHING_REJECTED=1
         fi
     else
-        echo "Warning: no changes applied on ${KERNEL_COUNTERPART}!"
+        echo "Warning: no changes applied on ${DEST}!"
     fi
 
     rm -f "$TMP_CURRENT" "$TMP_PARENT" >/dev/null 2>&1 || true
@@ -304,8 +308,7 @@ for CMT in "${COMMITS[@]}"; do
   fi
 
   if [[ "${ANYTHING_TO_ADD}" != 0 ]]; then
-    git commit --author="${MESSAGE_AUTHOR}" -m "${MESSAGE_NEW}" >> log.txt
-    if [ $? -eq 0 ]; then
+    if git commit --author="${MESSAGE_AUTHOR}" -m "${MESSAGE_NEW}" >> "${TMP_WORK}/log.txt" 2>&1; then
       ((SERIE_CNTR++))
       echo "Commit ${CMT}: ported and committed to '${BRANCH_NAME}'."
     else
