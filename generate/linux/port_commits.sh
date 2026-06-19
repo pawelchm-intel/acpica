@@ -174,6 +174,17 @@ for CMT in "${COMMITS[@]}"; do
     continue
   fi
 
+  # Skip commits already ported: a kernel commit whose subject mentions ACPICA
+  # and whose message contains the 8-char SHA of this ACPICA commit.
+  CMT_SHORT="${CMT:0:8}"
+  ALREADY_PORTED="$(git -C "${KERNEL_DIR}" log --no-merges --format=$'%H\t%s' \
+    --fixed-strings --grep="${CMT_SHORT}" \
+    | awk -F '\t' 'index($2, "ACPICA") {print $1; exit}')"
+  if [[ -n "${ALREADY_PORTED}" ]]; then
+    echo "Commit ${CMT}: already ported as kernel commit ${ALREADY_PORTED:0:12}, skipping."
+    continue
+  fi
+
   git checkout -- .
   git checkout -q "${CMT}"
 
