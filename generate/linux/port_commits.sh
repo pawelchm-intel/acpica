@@ -153,17 +153,40 @@ if [[ "${#COMMITS[@]}" -eq 0 ]]; then
 fi
 
 cd "${KERNEL_DIR}"
- 
+
 if git show-ref --verify --quiet "refs/heads/${BRANCH_NAME}"; then
   echo "Error: branch already exists ${BRANCH_NAME}"
   exit 2
 fi
+
+# Remember the branch we started on, so an abort can restore it.
+ORIG_BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || git rev-parse HEAD)"
+
+# Restore the kernel repo to the state before porting: discard any work tree
+# changes, return to the original branch and delete the branch we created.
+abort_port() {
+  echo "Aborting: restoring kernel repo to its state before porting."
+  cd "${KERNEL_DIR}"
+  git reset --hard >/dev/null 2>&1 || true
+  git checkout -- . >/dev/null 2>&1 || true
+  git checkout -q "${ORIG_BRANCH}" >/dev/null 2>&1 || true
+  git branch -D "${BRANCH_NAME}" >/dev/null 2>&1 || true
+}
+
+# Discard any partial changes from the current commit and clean up leftovers.
+skip_current_commit() {
+  cd "${KERNEL_DIR}"
+  git reset --hard >/dev/null 2>&1 || true
+  find . -type f -name "*.rej" -delete
+  find . -type f -name "*.orig" -delete
+}
 
 git checkout -b "${BRANCH_NAME}" >/dev/null
 
 for CMT in "${COMMITS[@]}"; do
   ANYTHING_REJECTED=0
   ANYTHING_TO_ADD=0
+  SKIP_COMMIT=0
 
   cd "${TMP_ACPICA}"
 
@@ -298,24 +321,79 @@ for CMT in "${COMMITS[@]}"; do
     DEST_DIR="$(dirname -- "$DEST")"
     DIFF_RESULT=$(diff --normal -E -p -w -B -b "$TMP_PARENT" "$TMP_CURRENT" || true)
     if [ -n "$DIFF_RESULT" ]; then
-        if ! patch -l -n -F 4 -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT"; then
-            ANYTHING_REJECTED=1
+        # Probe first: does the patch apply cleanly without touching the tree?
+        if patch -l -n -F 4 -f --dry-run -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT" >/dev/null 2>&1; then
+            patch -l -n -F 4 -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT"
+        else
+            echo "Conflict: patch does not apply cleanly to ${DEST}:"
+            patch -l -n -F 4 -f --dry-run -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT" || true
+            # Offer the same choices as 'git rebase' on a conflict.
+            while true; do
+                read -p "Choose: [c]ontinue / [s]kip / [a]bort: " ans < /dev/tty
+                case "${ans}" in
+                    c|continue )
+                        # Apply best-effort (may leave .rej). The user resolves
+                        # the conflict manually at the post-loop pause below.
+                        patch -l -n -F 4 -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT" || true
+                        ANYTHING_REJECTED=1
+                        break ;;
+                    s|skip )
+                        SKIP_COMMIT=1
+                        break ;;
+                    a|abort )
+                        abort_port
+                        exit 1 ;;
+                    * )
+                        echo "Please answer c, s or a." ;;
+                esac
+            done
         fi
     else
         echo "Warning: no changes applied on ${DEST}!"
     fi
 
     rm -f "$TMP_CURRENT" "$TMP_PARENT" >/dev/null 2>&1 || true
+
+    if [[ "${SKIP_COMMIT}" != 0 ]]; then
+        break
+    fi
+
     cd "${KERNEL_DIR}"
     git add "${DEST}"
   done
 
-  if [[ "${ANYTHING_REJECTED}" != 0 ]]; then
-    echo "Warning! Check the .rej files if any, and apply changes manually before resuming"
-    read -p "Press [Enter] to resume the script..."
-    echo "Continuing..."
-    find . -type f -name "*.rej" -delete
-    find . -type f -name "*.orig" -delete
+  # If 'continue' was chosen on a conflict, pause so the user can resolve the
+  # leftover .rej files manually, offering the same skip/abort choices again.
+  if [[ "${SKIP_COMMIT}" == 0 && "${ANYTHING_REJECTED}" != 0 ]]; then
+    cd "${KERNEL_DIR}"
+    echo "Warning! Check the .rej files if any, and apply changes manually before resuming."
+    # Offer the same choices as 'git rebase' on a conflict.
+    while true; do
+      read -p "Choose: [c]ontinue / [s]kip / [a]bort: " ans < /dev/tty
+      case "${ans}" in
+        c|continue )
+          echo "Continuing..."
+          find . -type f -name "*.rej" -delete
+          find . -type f -name "*.orig" -delete
+          break ;;
+        s|skip )
+          SKIP_COMMIT=1
+          break ;;
+        a|abort )
+          abort_port
+          exit 1 ;;
+        * )
+          echo "Please answer c, s or a." ;;
+      esac
+    done
+  fi
+
+  # Skip requested (either at the conflict prompt or the post-loop pause):
+  # discard any partial changes from this commit and move on to the next one.
+  if [[ "${SKIP_COMMIT}" != 0 ]]; then
+    skip_current_commit
+    echo "Commit ${CMT}: skipped on conflict."
+    continue
   fi
 
   if [[ "${ANYTHING_TO_ADD}" != 0 ]]; then
