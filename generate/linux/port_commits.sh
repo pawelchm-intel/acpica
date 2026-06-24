@@ -175,8 +175,7 @@ fi
 # Remember the branch we started on, so an abort can restore it.
 ORIG_BRANCH="$(git symbolic-ref --quiet --short HEAD 2>/dev/null || git rev-parse HEAD)"
 
-# Restore the kernel repo to the state before porting: discard any work tree
-# changes, return to the original branch and delete the branch we created.
+# Restore kernel repo a case of abort
 abort_port() {
   echo "Aborting: restoring kernel repo to its state before porting."
   cd "${KERNEL_DIR}"
@@ -196,11 +195,7 @@ skip_current_commit() {
 
 git checkout -b "${BRANCH_NAME}" >/dev/null
 
-# Build the "already ported" lookup once, instead of scanning the whole kernel
-# history with `git log --grep` for every commit in the range. We walk the
-# kernel history a single time, pick commits whose subject mentions ACPICA, and
-# record every short SHA (>=8 hex) referenced in their message, mapped to the
-# kernel commit that ported it. Per-commit lookup below is then O(1).
+# Build the "already ported" lookup
 echo "Indexing already-ported ACPICA commits in ${KERNEL_DIR}..."
 declare -A PORTED
 while IFS=$'\t' read -r prefix khash; do
@@ -231,15 +226,14 @@ for CMT in "${COMMITS[@]}"; do
 
   cd "${TMP_ACPICA}"
 
-  # Skip merge commits (preserve original check but don't abort)
+  # Skip merge commits
   PARENT_COUNT="$(git rev-list --parents -n 1 "${CMT}" | awk '{print NF-1}')"
   if [[ "${PARENT_COUNT}" -ne 1 ]]; then
     echo "Commit ${CMT}: is a merge commit (parents: ${PARENT_COUNT}), skipping."
     continue
   fi
 
-  # Skip commits already ported: a kernel commit whose subject mentions ACPICA
-  # and whose message contains the 8-char SHA of this ACPICA commit.
+  # Skip commits already ported: a kernel commit whose message contains the SHA of this ACPICA commit.
   CMT_SHORT="${CMT:0:8}"
   ALREADY_PORTED="${PORTED[${CMT_SHORT}]:-}"
   if [[ -n "${ALREADY_PORTED}" ]]; then
@@ -371,8 +365,6 @@ for CMT in "${COMMITS[@]}"; do
                 read -p "Choose: [c]ontinue / [s]kip / [a]bort: " ans < /dev/tty
                 case "${ans}" in
                     c|continue )
-                        # Apply best-effort (may leave .rej). The user resolves
-                        # the conflict manually at the post-loop pause below.
                         patch -l -n -F 4 -d "${DEST_DIR}" "$FILE_NAME" <<< "$DIFF_RESULT" || true
                         ANYTHING_REJECTED=1
                         break ;;
@@ -401,12 +393,10 @@ for CMT in "${COMMITS[@]}"; do
     git add "${DEST}"
   done
 
-  # If 'continue' was chosen on a conflict, pause so the user can resolve the
-  # leftover .rej files manually, offering the same skip/abort choices again.
+  # If 'continue' was chosen on a conflict, pause so the user can resolve the .rej files manually
   if [[ "${SKIP_COMMIT}" == 0 && "${ANYTHING_REJECTED}" != 0 ]]; then
     cd "${KERNEL_DIR}"
     echo "Warning! Check the .rej files if any, and apply changes manually before resuming."
-    # Offer the same choices as 'git rebase' on a conflict.
     while true; do
       read -p "Choose: [c]ontinue / [s]kip / [a]bort: " ans < /dev/tty
       case "${ans}" in
@@ -427,8 +417,6 @@ for CMT in "${COMMITS[@]}"; do
     done
   fi
 
-  # Skip requested (either at the conflict prompt or the post-loop pause):
-  # discard any partial changes from this commit and move on to the next one.
   if [[ "${SKIP_COMMIT}" != 0 ]]; then
     skip_current_commit
     echo "Commit ${CMT}: skipped on conflict."
