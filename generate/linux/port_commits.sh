@@ -183,6 +183,34 @@ skip_current_commit() {
 
 git checkout -b "${BRANCH_NAME}" >/dev/null
 
+# Build the "already ported" lookup once, instead of scanning the whole kernel
+# history with `git log --grep` for every commit in the range. We walk the
+# kernel history a single time, pick commits whose subject mentions ACPICA, and
+# record every short SHA (>=8 hex) referenced in their message, mapped to the
+# kernel commit that ported it. Per-commit lookup below is then O(1).
+echo "Indexing already-ported ACPICA commits in ${KERNEL_DIR}..."
+declare -A PORTED
+while IFS=$'\t' read -r prefix khash; do
+  [[ -n "${prefix}" ]] && PORTED["${prefix}"]="${khash}"
+done < <(
+  git -C "${KERNEL_DIR}" log --no-merges -z --format='%H%n%s%n%b' 2>/dev/null \
+  | LC_ALL=C awk 'BEGIN { RS="\0" }
+    {
+      nl1 = index($0, "\n")
+      khash = substr($0, 1, nl1 - 1)
+      rest = substr($0, nl1 + 1)
+      nl2 = index(rest, "\n")
+      subject = (nl2 ? substr(rest, 1, nl2 - 1) : rest)
+      if (index(subject, "ACPICA") == 0) next
+      # Record the first 8 chars of every hex token in subject+body.
+      s = rest
+      while (match(s, /[0-9a-f]{8,40}/)) {
+        print substr(s, RSTART, 8) "\t" khash
+        s = substr(s, RSTART + RLENGTH)
+      }
+    }'
+)
+
 for CMT in "${COMMITS[@]}"; do
   ANYTHING_REJECTED=0
   ANYTHING_TO_ADD=0
@@ -200,9 +228,7 @@ for CMT in "${COMMITS[@]}"; do
   # Skip commits already ported: a kernel commit whose subject mentions ACPICA
   # and whose message contains the 8-char SHA of this ACPICA commit.
   CMT_SHORT="${CMT:0:8}"
-  ALREADY_PORTED="$(git -C "${KERNEL_DIR}" log --no-merges --format=$'%H\t%s' \
-    --fixed-strings --grep="${CMT_SHORT}" \
-    | awk -F '\t' 'index($2, "ACPICA") {print $1; exit}')"
+  ALREADY_PORTED="${PORTED[${CMT_SHORT}]:-}"
   if [[ -n "${ALREADY_PORTED}" ]]; then
     echo "Commit ${CMT}: already ported as kernel commit ${ALREADY_PORTED:0:12}, skipping."
     continue
