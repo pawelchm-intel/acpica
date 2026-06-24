@@ -17,10 +17,23 @@
 #         exist in the kernel tree, placing them according to their original
 #         directory structure in the ACPICA repository, with the destination
 #         directory being dependent on the path inside ACPICA tree.
-#         It is important that the patches are ported on top of a counterpart 
-#         of a parent of the first commit from the range. In other case, 
-#         the first ported commit will also contain the diff between the 
-#         revisions of the parent commits.
+#
+#         Commits that already appear to be ported are skipped: a kernel
+#         commit whose subject mentions "ACPICA" and whose message references
+#         the short SHA of the ACPICA commit marks it as already ported.
+#
+#         Each commit message is rewritten for the kernel: the "ACPICA: "
+#         subject prefix, a "Link:" to the original ACPICA commit and a
+#         "Signed-off-by:" trailer are added automatically.
+#
+#         When a converted change does not apply cleanly, the script reports
+#         the conflict and offers the same choices as an interactive git
+#         rebase:
+#           continue - pause to let the conflict be resolved manually (e.g.
+#                      in another shell), then resume;
+#           skip     - discard this commit's partial changes and move on;
+#           abort    - restore the kernel repo to its original state (return
+#                      to the previous branch and delete the created branch).
 #
 #         Parameters:
 #         -d      Path to Linux kernel tree, to port into
