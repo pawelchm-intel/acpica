@@ -1,0 +1,62 @@
+name: App token check
+
+# Jednorazowy test konfiguracji GitHub App. Uruchamiany ręcznie:
+# Actions -> "App token check" -> Run workflow.
+# Po udanym teście plik można usunąć.
+
+on: workflow_dispatch
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint installation token
+        id: t
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          # Celowo bez `repositories:` — z samym `owner` token obejmuje wszystko,
+          # co objęła instalacja App. Dzięki temu test nie wymaga znania nazwy
+          # forka drzewa kernelowego, a wręcz ją wypisze.
+
+      - name: Co ten token widzi
+        env:
+          GH_TOKEN: ${{ steps.t.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "app-slug:        ${{ steps.t.outputs.app-slug }}"
+          echo "installation-id: ${{ steps.t.outputs.installation-id }}"
+          echo
+          echo "--- repozytoria objęte instalacją (nazwa / push / pull):"
+          gh api /installation/repositories --paginate \
+            --jq '.repositories[] | "\(.full_name)\tpush=\(.permissions.push)\tpull=\(.permissions.pull)"'
+          echo
+          echo "--- uprawnienia samego tokenu:"
+          gh api /rate_limit --jq '.rate | "limit=\(.limit) remaining=\(.remaining)"'
+
+      - name: Czy push do forka kernela przejdzie
+        env:
+          GH_TOKEN: ${{ steps.t.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Suchy push do nieistniejacego brancha: --dry-run negocjuje z serwerem
+          # i sprawdza uprawnienie do zapisu, ale niczego nie tworzy.
+          # KERNEL_REPO podstaw nazwa z listy wypisanej w poprzednim kroku.
+          KERNEL_REPO="${KERNEL_REPO:-}"
+          if [ -z "$KERNEL_REPO" ]; then
+            echo "::notice::ustaw KERNEL_REPO w tym kroku, zeby przetestowac push"
+            exit 0
+          fi
+          git config --global credential.helper store
+          printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+          git init -q probe && cd probe
+          git config user.name probe
+          git config user.email probe@example.invalid
+          git remote add origin \
+            "https://github.com/${{ github.repository_owner }}/${KERNEL_REPO}.git"
+          git commit -q --allow-empty -m probe
+          git push --dry-run origin HEAD:refs/heads/app-token-probe
+          echo "push OK (dry-run, nic nie powstalo)"
