@@ -1,0 +1,242 @@
+name: Port ACPICA PR to Linux tree
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [pending]
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: "Numer PR do sportowania"
+        required: true
+      kernel_base:
+        description: "Branch bazowy w drzewie kernelowym"
+        default: master
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: port-commits
+  cancel-in-progress: false
+
+env:
+  KERNEL_REPO: linux
+  KERNEL_BASE: ${{ inputs.kernel_base || 'master' }}
+
+jobs:
+  port:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - name: Token GitHub App
+        id: token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.APP_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: |
+            acpica
+            linux
+
+      - name: Narzędzia
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends clang-format patch
+          clang-format --version
+
+      - name: Clone repo A (ACPICA) + checkout pending
+        uses: actions/checkout@v4
+        with:
+          path: acpica
+          ref: pending
+          fetch-depth: 0
+          token: ${{ steps.token.outputs.token }}
+
+      - name: Zakres commitów PR
+        id: meta
+        working-directory: acpica
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          PR: ${{ github.event.pull_request.number || inputs.pr_number }}
+        run: |
+          set -euo pipefail
+          HEAD_SHA=$(gh api "repos/${{ github.repository }}/pulls/$PR" --jq .head.sha)
+          BASE_REF_SHA=$(gh api "repos/${{ github.repository }}/pulls/$PR" --jq .base.sha)
+
+          # Lokalny branch, nie refs/pull/*: port_commits.sh klonuje ten katalog
+          # przez ścieżkę, a lokalny klon przenosi tylko refs/heads/* i tagi.
+          git fetch --no-tags origin "refs/pull/${PR}/head:refs/heads/pr-${PR}"
+
+          if git cat-file -e "${BASE_REF_SHA}^{commit}" 2>/dev/null; then
+            BASE=$(git merge-base "$BASE_REF_SHA" "$HEAD_SHA")
+          else
+            echo "::warning::base.sha nieosiągalny, biorę rodzica pierwszego commita PR"
+            BASE=$(gh api "repos/${{ github.repository }}/pulls/$PR/commits" \
+                     --jq '.[0].parents[0].sha')
+          fi
+
+          RANGE="${BASE}..${HEAD_SHA}"
+          COUNT=$(git rev-list --count --no-merges "$RANGE")
+          FIRST=$(git rev-list --reverse --no-merges "$RANGE" | head -n1)
+          [ "$COUNT" -gt 0 ] || { echo "::error::zakres $RANGE jest pusty"; exit 1; }
+
+          {
+            echo "pr=$PR"
+            echo "range=$RANGE"
+            echo "first=$FIRST"
+            echo "last=$HEAD_SHA"
+            echo "count=$COUNT"
+          } | tee -a "$GITHUB_OUTPUT"
+          echo "LOG=$RUNNER_TEMP/port_commits-pr${PR}.log" >> "$GITHUB_ENV"
+          git log --oneline --no-merges "$RANGE"
+
+      - name: Cache acpisrc
+        id: cache-acpisrc
+        uses: actions/cache@v4
+        with:
+          path: acpica/generate/unix/bin/acpisrc
+          key: acpisrc-${{ hashFiles('acpica/source/tools/acpisrc/**', 'acpica/generate/unix/**') }}
+
+      - name: Zbuduj acpisrc
+        if: steps.cache-acpisrc.outputs.cache-hit != 'true'
+        working-directory: acpica
+        run: |
+          set -euo pipefail
+          make -C generate/unix acpisrc NOWERROR=TRUE -j"$(nproc)" \
+            || make -C generate/unix/acpisrc NOWERROR=TRUE -j"$(nproc)"
+          if [ ! -x generate/unix/bin/acpisrc ]; then
+            found=$(find generate/unix -type f -name acpisrc -perm -u+x | head -n1)
+            [ -n "$found" ] || { echo "::error::nie znalazłem zbudowanego acpisrc"; exit 1; }
+            mkdir -p generate/unix/bin && cp "$found" generate/unix/bin/acpisrc
+          fi
+          test -x generate/unix/bin/acpisrc
+
+      - name: Clone drzewa kernelowego
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -euo pipefail
+          echo "::add-mask::$GH_TOKEN"
+          git config --global credential.helper store
+          printf 'https://x-access-token:%s@github.com\n' "$GH_TOKEN" > ~/.git-credentials
+          chmod 600 ~/.git-credentials
+          # blobless, nie --depth: indeks "already ported" w port_commits.sh
+          # skanuje pełny git log drzewa kernelowego.
+          git clone --filter=blob:none --single-branch --branch "$KERNEL_BASE" \
+            "https://github.com/${{ github.repository_owner }}/${KERNEL_REPO}.git" linux
+          git -C linux log --oneline -1
+          df -h /
+
+      - name: Tożsamość git (Signed-off-by bierze się z repo kernela)
+        run: |
+          set -euo pipefail
+          test -n "${{ vars.SOB_NAME }}"  || { echo "::error::brak zmiennej SOB_NAME";  exit 1; }
+          test -n "${{ vars.SOB_EMAIL }}" || { echo "::error::brak zmiennej SOB_EMAIL"; exit 1; }
+          git config --global user.name  "${{ vars.SOB_NAME }}"
+          git config --global user.email "${{ vars.SOB_EMAIL }}"
+
+      - name: Resume, jeśli branch już istnieje
+        id: branch
+        working-directory: linux
+        run: |
+          set -euo pipefail
+          B="port/${{ steps.meta.outputs.pr }}"
+          if git ls-remote --exit-code --heads origin "$B" >/dev/null 2>&1; then
+            git fetch --no-tags origin "$B:refs/heads/$B"
+            echo "resume=1" >> "$GITHUB_OUTPUT"
+            echo "::notice::branch $B już istnieje, uruchamiam z -r"
+          else
+            echo "resume=0" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: port_commits.sh
+        id: port
+        working-directory: acpica
+        env:
+          TMPDIR: ${{ runner.temp }}
+          RANGE: ${{ steps.meta.outputs.range }}
+          BRANCH: port/${{ steps.meta.outputs.pr }}
+          RESUME: ${{ steps.branch.outputs.resume }}
+        run: |
+          args=(-d "$GITHUB_WORKSPACE/linux" -b "$BRANCH" -c abort -l "$LOG")
+          [ "$RESUME" = 1 ] && args+=(-r)
+          set +e
+          generate/linux/port_commits.sh "${args[@]}" "$RANGE"
+          rc=$?
+          set -e
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+          case $rc in
+            0)   msg="wszystkie commity sportowane czysto" ;;
+            1)   msg="błąd użycia skryptu" ;;
+            2)   msg="niespełniony warunek środowiska (nic nie zmieniono)" ;;
+            3)   msg="skończone, ale część commitów wymaga uwagi (skipped/partial/failed)" ;;
+            4)   msg="przerwane na konflikcie; drzewo kernelowe przywrócone" ;;
+            5)   msg="zapauzowane" ;;
+            130|143) msg="przerwane sygnałem" ;;
+            *)   msg="nieznany kod wyjścia" ;;
+          esac
+          echo "msg=$msg" >> "$GITHUB_OUTPUT"
+          echo "::notice::port_commits.sh rc=$rc — $msg"
+          exit 0
+
+      - name: Push port/${{ steps.meta.outputs.pr }}
+        if: steps.port.outputs.rc == '0'
+        working-directory: linux
+        run: |
+          set -euo pipefail
+          B="port/${{ steps.meta.outputs.pr }}"
+          git log --oneline "$KERNEL_BASE..$B" | tee "$RUNNER_TEMP/ported.txt"
+          git push origin "refs/heads/$B"
+
+      - name: Log jako artefakt
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: port-log-pr-${{ steps.meta.outputs.pr }}
+          path: ${{ env.LOG }}
+          if-no-files-found: warn
+          retention-days: 90
+
+      - name: Podsumowanie runu
+        if: always()
+        run: |
+          {
+            echo "### PR #${{ steps.meta.outputs.pr }} — rc=${{ steps.port.outputs.rc }} (${{ steps.port.outputs.msg }})"
+            echo "- zakres: \`${{ steps.meta.outputs.range }}\` — ${{ steps.meta.outputs.count }} commitów"
+            echo "- pierwszy: \`${{ steps.meta.outputs.first }}\`, ostatni: \`${{ steps.meta.outputs.last }}\`"
+            echo '```'
+            tail -n 400 "$LOG" 2>/dev/null || echo "(brak pliku logu)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Komentarz pod PR
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          RC='${{ steps.port.outputs.rc }}'
+          {
+            if [ "$RC" = 0 ]; then
+              echo "### ✅ Sportowane do \`port/${{ steps.meta.outputs.pr }}\` w ${{ env.KERNEL_REPO }}"
+            else
+              echo "### ⚠️ port_commits.sh rc=$RC — ${{ steps.port.outputs.msg }}"
+            fi
+            echo "- zakres: \`${{ steps.meta.outputs.range }}\` (${{ steps.meta.outputs.count }} commitów)"
+            echo "- baza kernela: \`${{ env.KERNEL_BASE }}\`"
+            echo "- [run i pełny log](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+            echo
+            echo '<details><summary>ogon logu</summary>'
+            echo; echo '```'
+            tail -n 120 "$LOG" 2>/dev/null || echo "(brak pliku logu)"
+            echo '```'; echo '</details>'
+          } > "$RUNNER_TEMP/comment.md"
+          gh pr comment "${{ steps.meta.outputs.pr }}" --body-file "$RUNNER_TEMP/comment.md"
+
+      - name: Status joba
+        if: steps.port.outputs.rc != '0'
+        run: exit 1
