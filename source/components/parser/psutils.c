@@ -192,6 +192,10 @@ AcpiPsFreeOp (
             "Free retval op: %p\n", Op));
     }
 
+    ACPI_DEBUG_PRINT ((ACPI_DB_ALLOCATIONS,
+        "Free op: %p, opcode: 0x%4.4X, flags: 0x%2.2X\n",
+        Op, Op->Common.AmlOpcode, Op->Common.Flags));
+
     if (Op->Common.Flags & ACPI_PARSEOP_GENERIC)
     {
         (void) AcpiOsReleaseObject (AcpiGbl_PsNodeCache, Op);
@@ -224,6 +228,25 @@ AcpiPsIsLeadingChar (
 
 
 /*
+ * Check whether the op can carry a name (test-only helper)
+ */
+static BOOLEAN
+AcpiPsHasNameField (
+    ACPI_PARSE_OBJECT       *Op)
+{
+
+    if (!Op)
+    {
+        return (FALSE);
+    }
+
+    /* The "generic" object has no name associated with it */
+
+    return ((BOOLEAN) !(Op->Common.Flags & ACPI_PARSEOP_GENERIC));
+}
+
+
+/*
  * Get op's name (4-byte name segment) or 0 if unnamed
  */
 UINT32
@@ -231,9 +254,7 @@ AcpiPsGetName (
     ACPI_PARSE_OBJECT       *Op)
 {
 
-    /* The "generic" object has no name associated with it */
-
-    if (Op->Common.Flags & ACPI_PARSEOP_GENERIC)
+    if (!AcpiPsHasNameField (Op))
     {
         return (0);
     }
@@ -253,9 +274,7 @@ AcpiPsSetName (
     UINT32                  name)
 {
 
-    /* The "generic" object has no name associated with it */
-
-    if (Op->Common.Flags & ACPI_PARSEOP_GENERIC)
+    if (!AcpiPsHasNameField (Op))
     {
         return;
     }
